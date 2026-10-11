@@ -615,6 +615,23 @@ fn callHostTool(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const state: *server.ServerState = @ptrCast(@alignCast(raw_state));
     if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+
+    // Build the params before registering the outbound request so malformed
+    // arguments fail the tool call without leaving a pending request behind.
+    var params: std.Io.Writer.Allocating = .init(alloc);
+    defer params.deinit();
+    writeHostToolCallParams(
+        alloc,
+        &params.writer,
+        if (state.active_session) |*session| session.session_id else "",
+        name,
+        call_id,
+        arguments_json,
+    ) catch |err| switch (err) {
+        error.InvalidToolArgumentsJson => return .{ .failure = try alloc.dupe(u8, "Host tool arguments are not valid JSON") },
+        else => return error.OutOfMemory,
+    };
+
     const outbound_id = (server.beginOutboundRequest(state, .host_tool) catch
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") }) orelse
         return .{ .failure = try alloc.dupe(u8, "Host tool request limit reached") };
@@ -627,21 +644,6 @@ fn callHostTool(
         }
     };
 
-    var params: std.Io.Writer.Allocating = .init(alloc);
-    defer params.deinit();
-    params.writer.writeAll("{\"sessionId\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(
-        if (state.active_session) |*session| session.session_id else "",
-        .{},
-        &params.writer,
-    ) catch return error.OutOfMemory;
-    params.writer.writeAll(",\"name\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(name, .{}, &params.writer) catch return error.OutOfMemory;
-    params.writer.writeAll(",\"toolCallId\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(call_id, .{}, &params.writer) catch return error.OutOfMemory;
-    params.writer.writeAll(",\"input\":") catch return error.OutOfMemory;
-    params.writer.writeAll(arguments_json) catch return error.OutOfMemory;
-    params.writer.writeByte('}') catch return error.OutOfMemory;
     state.writer.writeRequest(
         alloc,
         .{ .integer = @intCast(outbound_id) },
@@ -2392,6 +2394,29 @@ fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, argumen
         return error.InvalidToolArgumentsJson;
     defer parsed.deinit();
     try std.json.Stringify.value(parsed.value, .{}, writer);
+}
+
+/// Writes the `libfx/tool_call` params as one line. The model's arguments are
+/// parsed and reserialized compactly: JSON-RPC frames are newline delimited, so
+/// pretty-printed arguments written verbatim would split the frame and the host
+/// SDK would fail to parse it.
+fn writeHostToolCallParams(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    session_id: []const u8,
+    name: []const u8,
+    call_id: []const u8,
+    arguments_json: []const u8,
+) !void {
+    try writer.writeAll("{\"sessionId\":");
+    try std.json.Stringify.value(session_id, .{}, writer);
+    try writer.writeAll(",\"name\":");
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeAll(",\"toolCallId\":");
+    try std.json.Stringify.value(call_id, .{}, writer);
+    try writer.writeAll(",\"input\":");
+    try writeValidatedToolArguments(alloc, writer, arguments_json);
+    try writer.writeByte('}');
 }
 
 fn writePermissionOption(
@@ -4419,6 +4444,33 @@ test "ACP permission arguments are validated and reserialized before emission" {
         writeValidatedToolArguments(alloc, &malformed.writer, "{\"path\":}"),
     );
     try std.testing.expectEqual(@as(usize, 0), malformed.written().len);
+}
+
+test "libfx host tool call params reserialize pretty-printed arguments on one line" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try writeHostToolCallParams(
+        alloc,
+        &out.writer,
+        "2vNM-8fbbEmP",
+        "todo",
+        "call_1",
+        "{\n  \"items\": [\n    {\"text\": \"a\", \"done\": false}\n  ]\n}",
+    );
+    try std.testing.expectEqualStrings(
+        "{\"sessionId\":\"2vNM-8fbbEmP\",\"name\":\"todo\",\"toolCallId\":\"call_1\",\"input\":{\"items\":[{\"text\":\"a\",\"done\":false}]}}",
+        out.written(),
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), '\n') == null);
+
+    var malformed: std.Io.Writer.Allocating = .init(alloc);
+    defer malformed.deinit();
+    try std.testing.expectError(
+        error.InvalidToolArgumentsJson,
+        writeHostToolCallParams(alloc, &malformed.writer, "", "todo", "call_2", "{\"items\":"),
+    );
 }
 
 test "acp exposes web_search progress updates" {
